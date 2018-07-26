@@ -20,7 +20,7 @@
 - Efficiency between 84% and 92% (excluding board supply current of about 75mA)
 
 New in V 1.0:
-- Initial commit, tested with my 10W and 20W solar panels, charging my DIY USB power bank with 8 18650 cells in parallel. TP4056 lithium charger modules in paralel on the output
+- Initial commit, tested with my 10W and 20W solar panels, charging my DIY USB power bank with 8 18650 cells in parallel. Two TP4056 lithium charger modules in paralel on the output
 - An anti backfeed diode on the output is required, if you charge batteries directly! Otherwise, your low side mosfet may blow up!!
 
 To do:
