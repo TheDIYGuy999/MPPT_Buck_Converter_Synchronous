@@ -1,5 +1,5 @@
-/* Input voltage 15 - 22V
-   Output voltage 1 - 14.4V
+/* Input voltage 12 - 22V
+   Output voltage 2.5 - 14.4V
    Simple MPPT solar charge controller for 18V solar panels
    Sparkfun Pro Micro 5V, 16MHz or 3.3V, 8MHz (3.3v recommended, more efficient)
    ACS712 current sensor on the OUTPUT side
@@ -10,13 +10,14 @@
    WARNING! This device is not intended to drive 5V USB devices directly!
    Always use a regulated 5V USB adapter on the output! Otherwise, voltage glichtes may damage your USB device!
    This controller is COMMON NEGATIVE!
-   3 operation modes: MPPT, CV, CC
+   4 operation modes: MPPT, CV, CC, IDLE
    SD card data logger for time, voltage and current. You can import the txt files in Excel
    WARNING! Always adjust output voltage and output current limits according to your battery type!!
-   Efficiency between 84% and 92% (excluding board supply current of about 75mA)
+   Efficiency between 77% and 95% (including board supply current of about 75mA)
+   Anti backfeed protection (MOSFET Q1)
 */
 
-const float codeVersion = 1.0; // Software revision
+const float codeVersion = 1.1; // Software revision
 
 //
 // =======================================================================================================
@@ -83,10 +84,13 @@ float outputPower;
 float outputPowerDelta;
 float outputPowerPrevious = 9999.0; // Init value above max. panel power!
 float outputVoltage;
+float outputVoltageDelta;
 float outputVoltagePrevious;
 float outputCurrent;
 float energy;
-boolean undervolt;
+int pwmMin = 30; // 30, 12% (equals to 2.5V minimum output voltage @ 21V supply voltage)
+const int pwmMax = 242; // 242, 95%
+boolean buckIdle;
 boolean SDpresent;
 boolean displayOn = true;
 
@@ -107,16 +111,17 @@ const int acs712Offset = 503; // Zero offset is usually 512 = 1/2 of ADC range 5
 
 float pwm; // float required for finer granularity during calculadion in differential equations!
 boolean trackingDownwards; // true = downwards
-float vcc = 4.5; // Init value only. Will be read automatically later on
+float vcc = 3.3; // Init value only. Will be read automatically later on. Base for all our voltage readings!
 
 // Configuration variables
 float minPanelVoltage = 12.0; // 12.0
 float targetPanelVoltage = 14.0; // 14.0 (calculated by MPPT algorithm)
 float maxPanelVoltage = 16.0; // 16.0
+float panelOverVoltage = 22.0;
 // !!CAUTION: targetOutputVoltage is adjusted with the potentiometer!!
 float targetOutputVoltage = 4.2; // init value only! see above!!
 float trackingIncrement = 0.5; // MPPT tracking voltage step 0.5V
-float maxOutputCurrent = 3.0; // the desired output current limit. 3.0A requires heat sink on diode!!
+float maxOutputCurrent = 3.8; // the desired output current limit. (your hardware limit, the inductor im my case)
 float efficiency = 0.84; // About 84% (required for input current calculation)
 
 // Buttons
@@ -152,9 +157,6 @@ void setup() {
   Serial.begin(19200);
 #endif
 
-  // SD card setup
-  SD.begin(CHIP_SELECT);
-
   // PWM frequency
   setPWMPrescaler(PWM, 1 );  // 1 = 31.5kHz
 
@@ -172,26 +174,43 @@ void setup() {
 #ifdef __AVR_ATmega32U4__ // Pro Micro Board
   LED.begin(17); // Onboard LED on pin 17
 #else // Pro Mini Board
-  LED.begin(13); // Onboard LED on pin 17
+  LED.begin(13); // Onboard LED on pin 13
 #endif
 
   // Display setup
   u8g2.begin();
   u8g2.setFontRefHeightExtendedText();
   u8g2.setFont(u8g_font_7x14);
+  drawDisplay();
 
-  // switch off output
-  analogWrite(PWM, 12); // not 0 to keep bootstrap circuit running!
+  // Check vcc voltage (base for all voltage readings!)
+  checkVcc(true); // true = do it immeadiately
+
+  // Read sensors
+  delay(2000); // let voltages settling down
+  readSensors();
+  drawDisplay();
+
+  // Read Potentiometer
+  readPot();
+
+  // Idle buck converter (low side MOSFET protection)
+  buckConverterIdle();
+
+  // SD card setup
+  SD.begin(CHIP_SELECT);
+  writeSD(true); // do first log without delay (true)!
 }
 
 //
 // =======================================================================================================
-// READ POTENTIOMETER (lets you select the voltage range you want)
+// READ POTENTIOMETER (select the voltage range you want)
 // =======================================================================================================
 //
 void readPot() {
-  targetOutputVoltage = analogRead(POT) / 1023.0 + 4.2; // 4.2 - 5.2V
+  //targetOutputVoltage = analogRead(POT) / 1023.0 + 4.2; // 4.2 - 5.2V
   //targetOutputVoltage = analogRead(POT) / 71.04; // 0 - 14.4V
+  targetOutputVoltage = analogRead(POT) / 100.294 + 4.2; // 4.2 - 14.4V
 }
 
 //
@@ -202,9 +221,9 @@ void readPot() {
 
 boolean readButtons() {
 
-  // Display stays on for 10s, after a button was pressed
+  // Display stays on for 60s, after a button was pressed
   static unsigned long displayDelay;
-  if (millis() - displayDelay >= 10000) {
+  if (millis() - displayDelay >= 60000) {
     displayOn = false;
   }
 
@@ -236,7 +255,6 @@ boolean readButtons() {
       displayOn = true;
       displayDelay = millis();
     }
-
   }
 }
 
@@ -262,30 +280,54 @@ float averageA() { // Input power (running average)
 // Main sensor read function
 void readSensors() {
 
-  inputVoltage = analogRead(VSENSE_IN) * vcc / 93; // 1023 = vcc * 110 / 10 = 1023 / 55 = 18.6
+  inputVoltage = analogRead(VSENSE_IN) * vcc / 93; // 110k / 10k = 11. 1023 / 11 = 93
 
   outputCurrent = averageA();
 
   outputPower = outputVoltage * outputCurrent;
 
-  outputVoltage = analogRead(VSENSE_OUT) * vcc / 92; // 1023 = vcc * 110 / 10 = 1023 / 55 = 18.6
-
+  outputVoltage = analogRead(VSENSE_OUT) * vcc / 93; // 110k / 10k = 11. 1023 / 11 = 93
   inputCurrent = outputCurrent * outputVoltage / inputVoltage / efficiency;
+
+  // Low side mosfet protection (preventing pwm from going too low and shorting battery to GND)
+  if (controlMode == CV) pwmMin = (255 * targetOutputVoltage / inputVoltage) - 2; // Constant Voltage mode
+  else if (controlMode == MPPT) pwmMin = (255 * outputVoltage / inputVoltage) - 2; // MPPT mode
+  else pwmMin = 30;
+
+  pwmMin = constrain(pwmMin, 30, pwmMax); // Never allow pwm below 30
 }
 
 //
 // =======================================================================================================
-// LOCKOUT SUB FUNCTION
+// BUCK CONVERTER IDLE FUNCTION (IR2104 disabled, but PWM synchronous with measured voltage levels)
 // =======================================================================================================
 //
 
-void lockout() {
-  pwm = 12; // not 0 to keep bootstrap circuit running!
-  //digitalWrite(ENABLE, LOW); // Disable Mosfet driver
-  analogWrite(PWM, pwm); // Switch output off
+void buckConverterIdle() {
+  buckIdle = true;
+  digitalWrite(ENABLE, LOW); // Disable Mosfet driver (current can't flow from battery thru low side FET to GND)
+  pwm = 255 * outputVoltage / inputVoltage; // Keep the PWM signal synchronous to the voltage levels
+  pwm = constrain(pwm, pwmMin, pwmMax ); // 5 - 95%, because of bootstrap circuit!
+  analogWrite(PWM, pwm);
 #ifdef DEBUG
-  Serial.print("Over voltage lockout! ");
+  Serial.print("Buck Converter Idle!");
   Serial.println(outputVoltage);
+#endif
+}
+
+//
+// =======================================================================================================
+// BUCK CONVERTER DRIVE FUNCTION (IR2104 enabled, PWM according to required voltages)
+// =======================================================================================================
+//
+
+void buckConverterDrive() {
+  buckIdle = false;
+  pwm = constrain(pwm, pwmMin, pwmMax ); // 5 - 95%, because of bootstrap circuit!
+  analogWrite(PWM, pwm);
+  digitalWrite(ENABLE, HIGH); // Enable Mosfet driver
+#ifdef DEBUG
+  serialPrint();
 #endif
 }
 
@@ -297,7 +339,7 @@ void lockout() {
 void mppt() {
 
   /* MPPT Strategy:
-      There are tree controllers:
+      There are three controllers:
       - Output voltage controller
       - Output current controller
       - MPPT tracker, if output voltage is below target
@@ -306,32 +348,35 @@ void mppt() {
   // Read current voltages and current
   readSensors();
 
-  // Panel undervoltage lockout ---------------------------------------------------------------------------
-  while (outputVoltage < 1.0 && inputVoltage < 15.0) {  // 1.0 15.0
-    pwm = 70;
-    digitalWrite(ENABLE, LOW); // Disable Mosfet driver
-    analogWrite(PWM, pwm);
-    LED.on();
-    Serial.println("Panel undervoltage, waiting for more sun...");
-    undervolt = true;
-    delay(2000);
-    checkVcc();
+  // Panel undervoltage & negative current lockout (prevents from current flowing backwards)----------------
+  while ((outputVoltage < 1.0 && inputVoltage < 15.0) // while output < 1.0V and input < 15.0V
+         || inputVoltage > panelOverVoltage // or panel voltage is pushed too high from battery (wrong pwm)
+         || outputVoltage > inputVoltage // or output V > input V
+         //|| outputVoltage > (targetOutputVoltage + 2.0) // or output V > as (target V + 2.0V)
+         || outputCurrent < -0.2 // or negative current
+         || outputPower < -0.2) { // or negative power
+    buckConverterIdle(); // disable MOSFET driver, but keep pwm synchronuos with voltages
+    checkVcc(false); // with delay
+    readPot();
     readSensors();
+    readButtons();
     drawDisplay();
   }
 
   // Voltage and current controllers -----------------------------------------------------------------------
 
-  // If output voltage is near desired voltage: control target = output voltage! ---
-  if (outputVoltage > (targetOutputVoltage - 0.2) && (outputCurrent <= maxOutputCurrent) ) {
+  static unsigned long lastCurrentLimit;
+
+  // If output voltage is near desired voltage and current below limit: control target = output voltage! ---
+  if (outputVoltage > (targetOutputVoltage - 0.1) && (outputCurrent <= maxOutputCurrent)) {
     pwm += targetOutputVoltage - outputVoltage; // simple p (differential) controller
     if (inputVoltage < minPanelVoltage) pwm -= minPanelVoltage - inputVoltage;
     controlMode = CV; // Constant Voltage Mode
   }
 
   // Else if current only is above limit: control target = output current! ---
-  else if ((outputCurrent > maxOutputCurrent) && (outputVoltage < targetOutputVoltage)) {
-    pwm -= outputCurrent - maxOutputCurrent;
+  else if (outputCurrent > (maxOutputCurrent * 0.9)) { // 90% to prevent it from oscillating!
+    pwm -= (outputCurrent - maxOutputCurrent);
     controlMode = CC; // Constant Current Mode
   }
 
@@ -350,8 +395,10 @@ void mppt() {
     if (millis() - lastMppt >= 1000) { // Every 1000ms
       lastMppt = millis();
 
-      // Calculate power delta
+      // Calculate power and voltage delta
       outputPowerDelta = outputPower - outputPowerPrevious;
+      outputVoltageDelta = outputVoltage - outputVoltagePrevious;
+
 
       if (trackingDownwards) targetPanelVoltage -= trackingIncrement;
       else targetPanelVoltage += trackingIncrement;
@@ -373,34 +420,38 @@ void mppt() {
 
       else { // if within voltage limits, search for maximum power point!
         // Wrong tracking direction (less power than previously), so change it!
-        if (outputPowerDelta < 0.1) { // 0.03A current sensor step * 20V = 0.6W
-          trackingDownwards = !trackingDownwards;
+
+        // Voltage MPPT, if power is too small to be mearured properly
+        if (outputPower < 0.6) {
+          if (outputVoltageDelta < 0.2) { // 0.2V
+            trackingDownwards = !trackingDownwards;
+          }
+        }
+
+        // Power MPPT, if power is big enough to be measured properly
+        else {
+          if (outputPowerDelta < 0.1) { // 0.03A current sensor step * 20V = 0.6W (0.1 is OK)
+            trackingDownwards = !trackingDownwards;
+          }
         }
       }
 
-      // Store previous power for next comparison
+      // Store previous power and voltage for next comparison
       outputPowerPrevious = outputPower;
+      outputVoltagePrevious = outputVoltage;
     }
 
     // Calculate deviation
     static unsigned long lastCalc;
-    if (millis() - lastCalc >= 50) { // Every 50ms (prevent it from oscillating in low light condidions)
+    if (millis() - lastCalc >= 50) { // Every 50ms (prevent it from oscillating in low light conditions)
       lastCalc = millis();
       pwm -= targetPanelVoltage - inputVoltage; // simple p (differential) controller
+      //pwm = 255 * targetOutputVoltage / inputVoltage; // only valid for synchronous converter!
     }
   }
 
-  // Protection ----------------------------------------------------------------------------------------
-  if (outputVoltage > (targetOutputVoltage + 1.0)) lockout(); // Output overvoltage protection
-
   // Write PWM output ----------------------------------------------------------------------------------
-  pwm = constrain(pwm, 12, 242 ); // 5 - 95%, because of bootstrap circuit!
-  //pwm = analogRead(POT) * 256 / 1024;
-  serialPrint();
-
-  undervolt = false;
-  digitalWrite(ENABLE, HIGH); // Enable Mosfet driver
-  analogWrite(PWM, pwm);
+  buckConverterDrive();
 }
 
 //
@@ -409,22 +460,27 @@ void mppt() {
 // =======================================================================================================
 //
 void led() {
-  if (!displayOn) {
-    if (controlMode == MPPT) {
-      // Indicate panel voltage: 14 flashes = 14V etc.
-      LED.flash(20, 380, 700, inputVoltage); // ON, OFF, PAUSE, PULSES
-    }
-    if (controlMode == CV) {
-      //Constant voltage mode (flickering)
-      LED.flash(30, 100, 0, 0);
-    }
-    if (controlMode == CC) {
-      //Constant current mode (fast flickering)
-      LED.flash(30, 50, 0, 0);
-    }
-    if (controlMode == BP) {
-      //Battery protection mode (very fast flickering)
-      LED.flash(30, 25, 0, 0);
+  if (!displayOn) { // LED is only active, if the OLED is off
+
+    if (buckIdle) LED.on();
+    else {
+
+      if (controlMode == MPPT) {
+        // Indicate panel voltage: 14 flashes = 14V etc.
+        LED.flash(20, 380, 700, inputVoltage); // ON, OFF, PAUSE, PULSES
+      }
+      if (controlMode == CV) {
+        //Constant voltage mode (flickering)
+        LED.flash(30, 100, 0, 0);
+      }
+      if (controlMode == CC) {
+        //Constant current mode (fast flickering)
+        LED.flash(30, 50, 0, 0);
+      }
+      if (controlMode == BP) {
+        //Battery protection mode (very fast flickering)
+        LED.flash(30, 25, 0, 0);
+      }
     }
   }
   else LED.off();
@@ -435,10 +491,10 @@ void led() {
 // CHECK VCC VOLTAGE
 // =======================================================================================================
 //
-void checkVcc() {
+void checkVcc(boolean immediately) {
 
   static unsigned long lastVcc;
-  if (millis() - lastVcc >= 1000) { // Every 1000ms
+  if (millis() - lastVcc >= 200 || immediately) { // Every 200ms or immediately
     lastVcc = millis();
     vcc = readVcc() / 1000.0;
   }
@@ -536,10 +592,13 @@ void drawDisplay() {
         u8g2.print("Wh: ");
         u8g2.print(energy, 3);
 
+        u8g2.setCursor(79, 32);
+        u8g2.print(pwm, 0);
+
         // Mode & messages
         u8g2.setCursor(79, 64);
-        if (undervolt) {
-          u8g2.print("INP. <");
+        if (buckIdle) {
+          u8g2.print("IDLE");
         }
         else {
 
@@ -564,9 +623,9 @@ void drawDisplay() {
 // =======================================================================================================
 //
 
-void writeSD() {
+void writeSD(boolean noDelay) {
   static unsigned long lastLog;
-  if (millis() - lastLog >= loggingInterval) {
+  if (millis() - lastLog >= loggingInterval || noDelay) {
     lastLog = millis();
 
     TimeFile = SD.open("TIME.txt", FILE_WRITE);
@@ -600,9 +659,9 @@ void writeSD() {
 void loop() {
   readPot();
   readButtons();
-  checkVcc();
+  checkVcc(false); // with delay
   mppt();
   led();
   drawDisplay();
-  writeSD();
+  writeSD(false); // false = with interval timer
 }
