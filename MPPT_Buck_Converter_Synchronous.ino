@@ -17,7 +17,7 @@
    Anti backfeed protection (MOSFET Q1)
 */
 
-const float codeVersion = 1.1; // Software revision
+const float codeVersion = 1.2; // Software revision
 
 //
 // =======================================================================================================
@@ -41,7 +41,8 @@ const float codeVersion = 1.1; // Software revision
 #include <Wire.h>
 #include <statusLED.h> // TheDIYGuy999 library: https://github.com/TheDIYGuy999/statusLED
 #include <PWMFrequency.h> // https://github.com/TheDIYGuy999/PWMFrequency
-#include <U8g2lib.h> // https://github.com/olikraus/u8g2
+#include <U8g2lib.h> // https://github.com/olikraus/u8g2 IMPORTANT: use 2.0.7, newer versions require too much flash menory!
+//#include <U8x8lib.h>
 #include <SdFat.h>
 
 //
@@ -65,6 +66,7 @@ File CurFile;
 
 // OLED display SSD1306
 U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+//U8X8_SSD1306_128X64_NONAME_HW_I2C u8g2;
 
 // output pins
 #define PWM 9
@@ -76,7 +78,7 @@ U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 #define CHIP_SELECT 10
 
 // Global variables
-unsigned long displayInterval = 1000;
+unsigned long displayInterval = 500;
 unsigned long loggingInterval = 15000; // 15s
 float inputVoltage;
 float inputCurrent;
@@ -89,10 +91,11 @@ float outputVoltagePrevious;
 float outputCurrent;
 float energy;
 int pwmMin = 30; // 30, 12% (equals to 2.5V minimum output voltage @ 21V supply voltage)
-const int pwmMax = 242; // 242, 95%
+const int pwmMax = 242; // 242, 95% never more, because of charge pump operation!
 boolean buckIdle;
 boolean SDpresent;
 boolean displayOn = true;
+boolean flagNegativePower = false;
 
 byte controlMode;
 #define CV 1 // Constant Voltage
@@ -107,21 +110,23 @@ const float acs712VoltsPerAmp = 0.185; // 0.185 for 5A version, 0.100 for 20A, 0
 #if F_CPU == 8000000 // ACS712 3.3V supply (outside datasheet range...): 
 const float acs712VoltsPerAmp = 0.1221; // 0.1221 for 5A version, 0.066 for 20A, 0.04356 for 30A
 #endif
-const int acs712Offset = 503; // Zero offset is usually 512 = 1/2 of ADC range 5V:509, 3.3V: 503
+const int acs712Offset = 502; // Zero offset is usually 512 = 1/2 of ADC range 5V:509, 3.3V: 502 (adjust it, until amps show zero)
 
-float pwm; // float required for finer granularity during calculadion in differential equations!
+float pwm; // float required for finer granularity during calculation in differential equations!
 boolean trackingDownwards; // true = downwards
 float vcc = 3.3; // Init value only. Will be read automatically later on. Base for all our voltage readings!
 
 // Configuration variables
-float minPanelVoltage = 12.0; // 12.0
+const float minPanelVoltage = 12.0; // 12.0
 float targetPanelVoltage = 14.0; // 14.0 (calculated by MPPT algorithm)
-float maxPanelVoltage = 16.0; // 16.0
+float maxPanelVoltage = 17.9; // was 16.0, should be Vpm (about 17.9) of your panel
 float panelOverVoltage = 22.0;
+float lowPowerThreshold = 3.0; // 3 Watt (for max panel voltage switching)
 // !!CAUTION: targetOutputVoltage is adjusted with the potentiometer!!
 float targetOutputVoltage = 4.2; // init value only! see above!!
-float trackingIncrement = 0.5; // MPPT tracking voltage step 0.5V
-float maxOutputCurrent = 3.8; // the desired output current limit. (your hardware limit, the inductor im my case)
+float trackingIncrement = 0.5; // MPPT tracking voltage step (min. 0.5V, better 0.75, otherwise tracking will not work, because power delta is too small)
+float trackingDirectionChangeWattsThreshold = 0.1; // Tracking direction will change, if output power delta is below or even negative (about 0, up to 0.1)
+float maxOutputCurrent = 4.0; // the desired output current limit. (your hardware limit, the inductor im my case)
 float efficiency = 0.84; // About 84% (required for input current calculation)
 
 // Buttons
@@ -210,7 +215,8 @@ void setup() {
 void readPot() {
   //targetOutputVoltage = analogRead(POT) / 1023.0 + 4.2; // 4.2 - 5.2V
   //targetOutputVoltage = analogRead(POT) / 71.04; // 0 - 14.4V
-  targetOutputVoltage = analogRead(POT) / 100.294 + 4.2; // 4.2 - 14.4V
+  //targetOutputVoltage = analogRead(POT) / 100.294 + 4.2; // 4.2 - 14.4V (USB charger & 3S lead acid) <--
+  //targetOutputVoltage = analogRead(POT) / 132.0 + 4.75; // 4.75 - 12.5V (USB charger & 3S LiPo)
 }
 
 //
@@ -264,8 +270,10 @@ boolean readButtons() {
 // =======================================================================================================
 //
 
+static unsigned long delayNegativePower;
+
 // Averaging subfunctions
-float averageA() { // Input power (running average)
+float averageOutputA() { // Output power (running average)
   static float raw[4];
 
   raw[3] = raw[2];
@@ -276,17 +284,25 @@ float averageA() { // Input power (running average)
   return average;
 }
 
+float averageOutputVoltage() { // Output voltage (running average)
+  static float raw[4];
+
+  raw[3] = raw[2];
+  raw[2] = raw[1];
+  raw[1] = raw[0];
+  raw[0] = analogRead(VSENSE_OUT) * vcc / 93; // 110k / 10k = 11. 1023 / 11 = 93
+  float average = (raw[0] + raw[1] + raw[2] + raw[3]) / 4.0;
+  return average;
+}
 
 // Main sensor read function
 void readSensors() {
 
-  inputVoltage = analogRead(VSENSE_IN) * vcc / 93; // 110k / 10k = 11. 1023 / 11 = 93
-
-  outputCurrent = averageA();
-
+  outputVoltage = averageOutputVoltage();
+  outputCurrent = averageOutputA();
   outputPower = outputVoltage * outputCurrent;
 
-  outputVoltage = analogRead(VSENSE_OUT) * vcc / 93; // 110k / 10k = 11. 1023 / 11 = 93
+  inputVoltage = analogRead(VSENSE_IN) * vcc / 93; // 110k / 10k = 11. 1023 / 11 = 93
   inputCurrent = outputCurrent * outputVoltage / inputVoltage / efficiency;
 
   // Low side mosfet protection (preventing pwm from going too low and shorting battery to GND)
@@ -295,6 +311,13 @@ void readSensors() {
   else pwmMin = 30;
 
   pwmMin = constrain(pwmMin, 30, pwmMax); // Never allow pwm below 30
+
+  // Negative power flag (battery drain protection during night)
+  /*if (outputPower >= -0.3) delayNegativePower = millis();
+    if (millis() - delayNegativePower > 100) flagNegativePower = true;
+    else flagNegativePower = false;*/
+  if (outputPower >= -0.3) flagNegativePower = false;
+  else flagNegativePower = true;
 }
 
 //
@@ -345,63 +368,79 @@ void mppt() {
       - MPPT tracker, if output voltage is below target
   */
 
+  static unsigned long lastMppt;
+  static unsigned long delayHighMaxPanelVoltage;
+
+  static bool cv;
+  static bool cc;
+  static bool bp;
+
   // Read current voltages and current
   readSensors();
 
   // Panel undervoltage & negative current lockout (prevents from current flowing backwards)----------------
-  while ((outputVoltage < 1.0 && inputVoltage < 15.0) // while output < 1.0V and input < 15.0V
+  //while ((outputVoltage < 1.0 && inputVoltage < 15.0) // while output < 1.0V and input < 15.0V // only working with anti feedback protection, for example with TP4056!
+  while (inputVoltage < minPanelVoltage - 1.0 // while input voltage < about 11.0V (sunset condition)
+         || flagNegativePower // or negative power (sunset condition)
          || inputVoltage > panelOverVoltage // or panel voltage is pushed too high from battery (wrong pwm)
          || outputVoltage > inputVoltage // or output V > input V
-         //|| outputVoltage > (targetOutputVoltage + 2.0) // or output V > as (target V + 2.0V)
-         || outputCurrent < -0.2 // or negative current
-         || outputPower < -0.2) { // or negative power
+        ) {
     buckConverterIdle(); // disable MOSFET driver, but keep pwm synchronuos with voltages
     checkVcc(false); // with delay
+    lastMppt = millis();
     readPot();
     readSensors();
     readButtons();
     drawDisplay();
+    led();
   }
 
   // Voltage and current controllers -----------------------------------------------------------------------
 
-  static unsigned long lastCurrentLimit;
-
-  // If output voltage is near desired voltage and current below limit: control target = output voltage! ---
-  if (outputVoltage > (targetOutputVoltage - 0.1) && (outputCurrent <= maxOutputCurrent)) {
-    pwm += targetOutputVoltage - outputVoltage; // simple p (differential) controller
-    if (inputVoltage < minPanelVoltage) pwm -= minPanelVoltage - inputVoltage;
+  // If output voltage is above desired voltage: control target = output voltage! ---
+  if (outputVoltage > targetOutputVoltage) {
+    pwm += (targetOutputVoltage - outputVoltage) * 0.5; // simple p (differential) controller
+    outputPowerDelta = 0;
+    lastMppt = millis();
     controlMode = CV; // Constant Voltage Mode
+    cv = true;
   }
 
   // Else if current only is above limit: control target = output current! ---
-  else if (outputCurrent > (maxOutputCurrent * 0.9)) { // 90% to prevent it from oscillating!
-    pwm -= (outputCurrent - maxOutputCurrent);
+  else if (outputCurrent > maxOutputCurrent) {
+    pwm -= (outputCurrent - maxOutputCurrent) * 0.005;
+    outputPowerDelta = 0;
+    lastMppt = millis();
     controlMode = CC; // Constant Current Mode
+    cc = true;
   }
 
   // Else if current AND voltage are above limit: decrease PWM ---
-  else if ((outputCurrent > maxOutputCurrent) && (outputVoltage > targetOutputVoltage)) {
+  else if (outputCurrent > (maxOutputCurrent * 1.2) && outputVoltage > (targetOutputVoltage * 1.2)) {
     pwm --;
+    outputPowerDelta = 0;
+    lastMppt = millis();
     controlMode = BP; // Battery Protection Mode
+    bp = true;
+  }
+
+  if (outputCurrent < (maxOutputCurrent * 0.9) && outputVoltage < (targetOutputVoltage * 0.95)) {
+    cv = false;
+    cc = false;
+    bp = false;
   }
 
   // else: control target = MPPT ---
-  else {
+  if (!cv && !cc && !bp) {
     controlMode = MPPT; // Maximum Power Point Tracking
 
     // MPPT (max. input power) tracking direction (upwards / downwards is related to panel voltage!)
-    static unsigned long lastMppt;
     if (millis() - lastMppt >= 1000) { // Every 1000ms
       lastMppt = millis();
 
       // Calculate power and voltage delta
       outputPowerDelta = outputPower - outputPowerPrevious;
       outputVoltageDelta = outputVoltage - outputVoltagePrevious;
-
-
-      if (trackingDownwards) targetPanelVoltage -= trackingIncrement;
-      else targetPanelVoltage += trackingIncrement;
 
 
       // Tracking direction is depending on the panel voltage, if outside limits!
@@ -420,20 +459,21 @@ void mppt() {
 
       else { // if within voltage limits, search for maximum power point!
         // Wrong tracking direction (less power than previously), so change it!
-
-        // Voltage MPPT, if power is too small to be mearured properly
-        if (outputPower < 0.6) {
-          if (outputVoltageDelta < 0.2) { // 0.2V
-            trackingDownwards = !trackingDownwards;
-          }
+        if (outputPowerDelta < trackingDirectionChangeWattsThreshold) { // 0.03A current sensor step * 3.5V = 0.1W (0.1 is OK)
+          trackingDownwards = !trackingDownwards;
         }
+      }
 
-        // Power MPPT, if power is big enough to be measured properly
-        else {
-          if (outputPowerDelta < 0.1) { // 0.03A current sensor step * 20V = 0.6W (0.1 is OK)
-            trackingDownwards = !trackingDownwards;
-          }
-        }
+      if (trackingDownwards) targetPanelVoltage -= trackingIncrement;
+      else targetPanelVoltage += trackingIncrement;
+
+      // Low power bodge, because MPPT does not track properly, if power is too low
+      if (outputPower < lowPowerThreshold) delayHighMaxPanelVoltage = millis();
+      if (millis() - delayHighMaxPanelVoltage > 1000) maxPanelVoltage = 17.9;
+      else maxPanelVoltage = 14.5;
+
+      if (analogRead(POT) > 2) {
+        targetPanelVoltage = analogRead(POT) / 173.38 + 12.0; // 12 - 17.9V // TODO, for MPPT testing! <<<<<<<<<<<<<<<<<<<<
       }
 
       // Store previous power and voltage for next comparison
@@ -441,14 +481,14 @@ void mppt() {
       outputVoltagePrevious = outputVoltage;
     }
 
-    // Calculate deviation
+    // Calculate target panel voltage
     static unsigned long lastCalc;
     if (millis() - lastCalc >= 50) { // Every 50ms (prevent it from oscillating in low light conditions)
       lastCalc = millis();
       pwm -= targetPanelVoltage - inputVoltage; // simple p (differential) controller
       //pwm = 255 * targetOutputVoltage / inputVoltage; // only valid for synchronous converter!
     }
-  }
+  } // End of MPPT ---
 
   // Write PWM output ----------------------------------------------------------------------------------
   buckConverterDrive();
@@ -462,7 +502,10 @@ void mppt() {
 void led() {
   if (!displayOn) { // LED is only active, if the OLED is off
 
-    if (buckIdle) LED.on();
+    if (buckIdle) {
+      //LED.on();
+      LED.flash(30, 2000, 0, 0);
+    }
     else {
 
       if (controlMode == MPPT) {
@@ -513,8 +556,9 @@ void serialPrint() {
 
     // Mode
     if (controlMode == MPPT) {
-      Serial.print("MPPT ");
-      Serial.print(trackingDownwards);
+      if (trackingDownwards) Serial.print("MPPT -");
+      else Serial.print("MPPT +");
+
     }
     if (controlMode == CV) {
       Serial.print("CV   ");
@@ -568,7 +612,7 @@ void drawDisplay() {
     lastDisplay = millis();
 
     // Do energy calculation
-    energy = energy + outputVoltage * outputCurrent / (3600 * (1000 / displayInterval)); // Wh / 3600 = Ws
+    energy = energy + outputVoltage * outputCurrent / (3600 * (1000 / displayInterval)); // Ws / 3600 = Wh
 
     u8g2.firstPage();  // clear screen
     do {
@@ -602,7 +646,10 @@ void drawDisplay() {
         }
         else {
 
-          if (controlMode == MPPT) u8g2.print("MPPT ");
+          if (controlMode == MPPT) {
+            if (trackingDownwards) u8g2.print("MPPT -");
+            else u8g2.print("MPPT +");
+          }
           if (controlMode == CV) u8g2.print("CV");
           if (controlMode == CC) u8g2.print("CC");
           if (controlMode == BP) u8g2.print("BP");
@@ -611,7 +658,18 @@ void drawDisplay() {
         // SD card presence
         u8g2.setCursor(79, 48);
         if (SDpresent) u8g2.print("SD OK");
-        else u8g2.print("No SD");
+        else {
+          //else u8g2.print("No SD"); // TODO
+          
+          //u8g2.print(targetPanelVoltage);
+          //u8g2.print("Vt");
+          
+          u8g2.print("d ");
+          u8g2.print(outputPowerDelta);
+          
+          //u8g2.print(maxPanelVoltage);
+          //u8g2.print(flagNegativePower);
+        }
       }
     } while ( u8g2.nextPage() ); // show display queue
   }

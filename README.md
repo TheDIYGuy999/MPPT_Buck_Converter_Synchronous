@@ -31,6 +31,9 @@ New in V 1.1:
 - Freewheel diode D5 added to improve efficiency
 - LM317T regulator replaced with a more efficient MP1584EN step down module
 
+New in V 1.2:
+- Optimised for 4.2V 1S LiPo 18650 direct charging
+
 To do:
 - Adding a configuration menu, using the buttons
 - Changing the inductor to allow 5A charge current
