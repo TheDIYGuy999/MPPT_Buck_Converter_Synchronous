@@ -15,7 +15,7 @@
 - WARNING! This device is not intended to drive 5V USB devices directly. Do it at your own risk!
 - Always use a regulated 5V USB adapter on the output! Otherwise, voltage glichtes may damage your USB device!
 - This controller is COMMON NEGATIVE
-- 3 operation modes: MPPT, CV, CC
+- 4 operation modes: MPPT, CV, CC, Idle
 - SD card data logger for time, voltage and current. You can import the txt files in Excel
 - WARNING! Always adjust output voltage and output current limits according to your battery type, before you connect the battery
 - Efficiency between 72% and 92%
@@ -32,7 +32,15 @@ New in V 1.1:
 - LM317T regulator replaced with a more efficient MP1584EN step down module
 
 New in V 1.2:
-- Optimised for 4.2V 1S LiPo 18650 direct charging
+- Optimized for 4.2V 1S LiPo 18650 direct charging
+
+New in V 1.3:
+- Display now using u8x8 instead of u8g2 in order to save flash memory
+- Ah is displayed as well, not just Wh.
+- Splash screen shows SW version
+- Switchable display content, using Menu button
+- Pot is used for manual / automatic MPPT tracking instead of output voltage adjustment
+- tested with my 10W and 20W solar panels, charging my DIY USB power bank with 8 18650 cells in parallel. The TP4056 board is not used as chrarger anymore, just as BMS (overcharging, overdischarging, overcurrent). The 18650 cells are connected to the B+ and B- terminals, the charger and the USB aoutput stepup modules to the  OUT+ and OUT- terminals. The output voltage is 4.2v , which is the maximum charge voltage of an 18650 cell.
 
 To do:
 - Adding a configuration menu, using the buttons

@@ -17,7 +17,7 @@
    Anti backfeed protection (MOSFET Q1)
 */
 
-const float codeVersion = 1.2; // Software revision
+const float codeVersion = 1.3; // Software revision
 
 //
 // =======================================================================================================
@@ -41,8 +41,7 @@ const float codeVersion = 1.2; // Software revision
 #include <Wire.h>
 #include <statusLED.h> // TheDIYGuy999 library: https://github.com/TheDIYGuy999/statusLED
 #include <PWMFrequency.h> // https://github.com/TheDIYGuy999/PWMFrequency
-#include <U8g2lib.h> // https://github.com/olikraus/u8g2 IMPORTANT: use 2.0.7, newer versions require too much flash menory!
-//#include <U8x8lib.h>
+#include <U8x8lib.h> // Part of the u8g2 library
 #include <SdFat.h>
 
 //
@@ -65,8 +64,9 @@ File VoltFile;
 File CurFile;
 
 // OLED display SSD1306
-U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
-//U8X8_SSD1306_128X64_NONAME_HW_I2C u8g2;
+//u8x8_SSD1306_128X64_NONAME_1_HW_I2C u8x8(u8x8_R0, /* reset=*/ U8X8_PIN_NONE);
+//U8X8_SSD1306_64X64_NONAME_HW_I2C u8x8(/* reset=*/ U8X8_PIN_NONE);
+U8X8_SSD1306_128X64_NONAME_HW_I2C u8x8;
 
 // output pins
 #define PWM 9
@@ -90,12 +90,15 @@ float outputVoltageDelta;
 float outputVoltagePrevious;
 float outputCurrent;
 float energy;
-int pwmMin = 30; // 30, 12% (equals to 2.5V minimum output voltage @ 21V supply voltage)
+float Ah;
+int pwmMin = 30; // 30, 12% (equals to 2.5V minimum output voltage @ 21V supply voltage, init value only)
 const int pwmMax = 242; // 242, 95% never more, because of charge pump operation!
 boolean buckIdle;
 boolean SDpresent;
 boolean displayOn = true;
 boolean flagNegativePower = false;
+
+int screen = 1;
 
 byte controlMode;
 #define CV 1 // Constant Voltage
@@ -124,9 +127,10 @@ float panelOverVoltage = 22.0;
 float lowPowerThreshold = 3.0; // 3 Watt (for max panel voltage switching)
 // !!CAUTION: targetOutputVoltage is adjusted with the potentiometer!!
 float targetOutputVoltage = 4.2; // init value only! see above!!
+float minOutputVoltage = 3.0;
 float trackingIncrement = 0.5; // MPPT tracking voltage step (min. 0.5V, better 0.75, otherwise tracking will not work, because power delta is too small)
 float trackingDirectionChangeWattsThreshold = 0.1; // Tracking direction will change, if output power delta is below or even negative (about 0, up to 0.1)
-float maxOutputCurrent = 4.0; // the desired output current limit. (your hardware limit, the inductor im my case)
+float maxOutputCurrent = 5.0; // the desired output current limit. (your hardware limit, the inductor im my case)
 float efficiency = 0.84; // About 84% (required for input current calculation)
 
 // Buttons
@@ -183,17 +187,23 @@ void setup() {
 #endif
 
   // Display setup
-  u8g2.begin();
-  u8g2.setFontRefHeightExtendedText();
-  u8g2.setFont(u8g_font_7x14);
-  drawDisplay();
+  u8x8.begin();
+  u8x8.setFont(u8x8_font_7x14_1x2_r); // _f = full, _r = reduced, _n = numbers https://github.com/olikraus/u8g2/wiki/fntlist8x8
+
+  // Show splash screen
+  u8x8.setCursor(0, 0);
+  u8x8.print("MPPT controller");
+  u8x8.setCursor(0, 4);
+  u8x8.print("SW version: ");
+  u8x8.print(codeVersion);
 
   // Check vcc voltage (base for all voltage readings!)
-  checkVcc(true); // true = do it immeadiately
+  checkVcc(true); // true = do it immediately
 
   // Read sensors
   delay(2000); // let voltages settling down
   readSensors();
+  u8x8.clear();
   drawDisplay();
 
   // Read Potentiometer
@@ -241,8 +251,11 @@ boolean readButtons() {
     // Menu button
     if (DFE(digitalRead(BUTTON_MENU), buttonMenuFallingState)) {
       displayOn = true;
+      screen++;
+      u8x8.clear();
       displayDelay = millis();
     }
+    if (screen > 5) screen = 1;
 
     // Minus button
     if (DFE(digitalRead(BUTTON_MINUS), buttonMinusFallingState)) {
@@ -306,18 +319,17 @@ void readSensors() {
   inputCurrent = outputCurrent * outputVoltage / inputVoltage / efficiency;
 
   // Low side mosfet protection (preventing pwm from going too low and shorting battery to GND)
-  if (controlMode == CV) pwmMin = (255 * targetOutputVoltage / inputVoltage) - 2; // Constant Voltage mode
-  else if (controlMode == MPPT) pwmMin = (255 * outputVoltage / inputVoltage) - 2; // MPPT mode
+  if (controlMode == MPPT) pwmMin = (255 * minOutputVoltage / inputVoltage); // MPPT mode
   else pwmMin = 30;
 
-  pwmMin = constrain(pwmMin, 30, pwmMax); // Never allow pwm below 30
+  pwmMin = constrain(pwmMin, 30, pwmMax); // Never allow pwm below 30 (low side mosfet protection)
 
   // Negative power flag (battery drain protection during night)
   /*if (outputPower >= -0.3) delayNegativePower = millis();
     if (millis() - delayNegativePower > 100) flagNegativePower = true;
     else flagNegativePower = false;*/
-  if (outputPower >= -0.3) flagNegativePower = false;
-  else flagNegativePower = true;
+  if (outputPower >= 0.0) flagNegativePower = false;
+  if (outputPower < -0.3) flagNegativePower = true;
 }
 
 //
@@ -379,9 +391,8 @@ void mppt() {
   readSensors();
 
   // Panel undervoltage & negative current lockout (prevents from current flowing backwards)----------------
-  //while ((outputVoltage < 1.0 && inputVoltage < 15.0) // while output < 1.0V and input < 15.0V // only working with anti feedback protection, for example with TP4056!
-  while (inputVoltage < minPanelVoltage - 1.0 // while input voltage < about 11.0V (sunset condition)
-         || flagNegativePower // or negative power (sunset condition)
+  while (inputVoltage < minPanelVoltage - 1.0 // while input voltage < about 11.0V (sunset or sunrise condition)
+         || flagNegativePower // or negative power (sunset or sunrise condition)
          || inputVoltage > panelOverVoltage // or panel voltage is pushed too high from battery (wrong pwm)
          || outputVoltage > inputVoltage // or output V > input V
         ) {
@@ -502,8 +513,8 @@ void mppt() {
 void led() {
   if (!displayOn) { // LED is only active, if the OLED is off
 
+    //Idle mode (slow flashing)
     if (buckIdle) {
-      //LED.on();
       LED.flash(30, 2000, 0, 0);
     }
     else {
@@ -608,70 +619,103 @@ void serialPrint() {
 
 void drawDisplay() {
   static unsigned long lastDisplay;
+  static unsigned long lastDisplayState;
+  static bool displayState;
+
+  if (millis() - lastDisplayState >= 3000) {
+    lastDisplayState = millis();
+    displayState = !displayState;
+  }
+
   if (millis() - lastDisplay >= displayInterval) {
     lastDisplay = millis();
 
     // Do energy calculation
-    energy = energy + outputVoltage * outputCurrent / (3600 * (1000 / displayInterval)); // Ws / 3600 = Wh
+    if (!buckIdle) {
+      energy = energy + outputVoltage * outputCurrent / (3600 * (1000 / displayInterval)); // Ws / 3600 = Wh
+      Ah = Ah + outputCurrent / (3600 * (1000 / displayInterval)); // As / 3600 = Ah
+    }
 
-    u8g2.firstPage();  // clear screen
-    do {
-      if (displayOn) {
-        u8g2.setCursor(0, 16);
-        u8g2.print("V:  ");
-        u8g2.print(outputVoltage);
 
-        u8g2.setCursor(79, 16);
-        u8g2.print(inputVoltage);
+    if (displayOn) {
+      u8x8.setCursor(0, 0); // x, y positions in raws and lines, not in pixels
+      u8x8.print("V: ");
+      u8x8.print(outputVoltage);
 
-        u8g2.setCursor(0, 32);
-        u8g2.print("A:  ");
-        u8g2.print(outputCurrent, 3);
+      u8x8.setCursor(9, 0);
+      u8x8.print(inputVoltage);
 
-        u8g2.setCursor(0, 48);
-        u8g2.print("W:  ");
-        u8g2.print(outputVoltage * outputCurrent);
+      u8x8.setCursor(0, 2);
+      u8x8.print("A: ");
+      u8x8.print(outputCurrent, 3);
 
-        u8g2.setCursor(0, 64);
-        u8g2.print("Wh: ");
-        u8g2.print(energy, 3);
+      u8x8.setCursor(0, 4);
+      u8x8.print("W: ");
+      u8x8.print(outputPower);
 
-        u8g2.setCursor(79, 32);
-        u8g2.print(pwm, 0);
+      u8x8.setCursor(0, 6);
+      if (displayState) {
+        u8x8.print("Wh:");
+        u8x8.print(energy, 3);
+      }
+      else {
+        u8x8.print("Ah:");
+        u8x8.print(Ah, 3);
+      }
 
-        // Mode & messages
-        u8g2.setCursor(79, 64);
-        if (buckIdle) {
-          u8g2.print("IDLE");
+      u8x8.setCursor(9, 2);
+      u8x8.print("PWM ");
+      u8x8.print(pwm, 0);
+
+      // Mode & messages
+      u8x8.setCursor(9, 6);
+      if (buckIdle) {
+        u8x8.print("IDLE");
+      }
+      else {
+
+        if (controlMode == MPPT) {
+          if (trackingDownwards) u8x8.print("MPPT -");
+          else u8x8.print("MPPT +");
         }
-        else {
+        if (controlMode == CV) u8x8.print("CV");
+        if (controlMode == CC) u8x8.print("CC");
+        if (controlMode == BP) u8x8.print("BP");
+      }
 
-          if (controlMode == MPPT) {
-            if (trackingDownwards) u8g2.print("MPPT -");
-            else u8g2.print("MPPT +");
-          }
-          if (controlMode == CV) u8g2.print("CV");
-          if (controlMode == CC) u8g2.print("CC");
-          if (controlMode == BP) u8g2.print("BP");
+      // SD card presence
+      u8x8.setCursor(9, 4);
+      if (SDpresent) u8x8.print("SD OK");
+      else {
+        if (screen == 1) {
+          u8x8.print("No SD");
         }
 
-        // SD card presence
-        u8g2.setCursor(79, 48);
-        if (SDpresent) u8g2.print("SD OK");
-        else {
-          //else u8g2.print("No SD"); // TODO
-          
-          //u8g2.print(targetPanelVoltage);
-          //u8g2.print("Vt");
-          
-          u8g2.print("d ");
-          u8g2.print(outputPowerDelta);
-          
-          //u8g2.print(maxPanelVoltage);
-          //u8g2.print(flagNegativePower);
+        if (screen == 2) {
+          u8x8.print("d ");
+          u8x8.print(outputPowerDelta);
+        }
+
+        if (screen == 3) {
+          u8x8.print("Vt");
+          u8x8.print(targetPanelVoltage);
+        }
+
+        if (screen == 4) {
+          u8x8.print("Vm");
+          u8x8.print(maxPanelVoltage);
+        }
+
+        if (screen == 5) {
+          u8x8.print("min ");
+          u8x8.print(pwmMin);
         }
       }
-    } while ( u8g2.nextPage() ); // show display queue
+
+    }
+    else {
+      u8x8.clear();
+    }
   }
 }
 
